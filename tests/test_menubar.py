@@ -544,13 +544,20 @@ def test_format_title_reflects_passed_weekly_reset():
 
 # --- all-accounts title -------------------------------------------------------
 
-def _row(num, email, *, active=False, usage=None, alias=None, disabled=False):
-    """An ``_adapt_snapshot`` account row."""
-    return (num, email, active, usage, usage, alias, disabled, None)
+def _row(num, email, *, active=False, usage=None, alias=None, disabled=False, display=None):
+    """An ``_adapt_snapshot`` account row; ``display`` defaults to ``usage``
+    (a sentinel note string stands in for an expired/unavailable account)."""
+    return (num, email, active, usage if display is None else display, usage, alias, disabled, None)
 
 
 def test_settings_title_style_defaults_to_active(tmp_path: Path):
     assert menubar.MenuBarSettings.load(tmp_path / "nope.json").title_style == "active"
+
+
+def test_settings_title_style_round_trip(tmp_path: Path):
+    path = tmp_path / "menubar_settings.json"
+    menubar.MenuBarSettings(title_style="all").save(path)
+    assert menubar.MenuBarSettings.load(path).title_style == "all"
 
 
 def test_usage_level_buckets():
@@ -581,6 +588,23 @@ def test_title_cells_label_falls_back_to_short_local_part():
     assert cells[0].label == "averylo*"
 
 
+def test_title_cells_long_alias_is_shortened_too():
+    cells = menubar.title_cells([_row(1, "a@x.com", alias="personal-account", usage=_USAGE)], _NOW)
+    assert cells[0].label == "persona*"
+
+
+def test_title_cells_expired_account_keeps_last_numbers_but_is_stale():
+    rows = [_row(1, "a@x.com", usage=_USAGE, display="token expired")]
+    cell = menubar.title_cells(rows, _NOW)[0]
+    assert (cell.five_hour, cell.seven_day, cell.stale) == (42.0, 18.0, True)
+    assert menubar.title_cells([_row(1, "a@x.com", usage=_USAGE)], _NOW)[0].stale is False
+
+
+def test_title_cells_keeps_a_disabled_account_while_it_is_in_use():
+    rows = [_row(1, "a@x.com", usage=_USAGE, disabled=True, active=True)]
+    assert [c.label for c in menubar.title_cells(rows, _NOW)] == ["a"]
+
+
 def test_title_cells_unmeasured_account_shows_unknowns():
     cells = menubar.title_cells([_row(1, "a@x.com", usage=None)], _NOW)
     assert (cells[0].five_hour, cells[0].seven_day) == (None, None)
@@ -597,8 +621,9 @@ def test_format_all_title_stars_active_account():
         menubar.TitleCell("home", 5.0, 2.0, False),
         menubar.TitleCell("work", 8.0, 85.0, True),
         menubar.TitleCell("side", None, None, False),
+        menubar.TitleCell("old", 40.0, 60.0, False, stale=True),
     ]
-    assert menubar.format_all_title(cells) == "⇄ home 5·2  *work 8·85  side –·–"
+    assert menubar.format_all_title(cells) == "⇄ home 5·2  *work 8·85  side –·–  old 40·60?"
 
 
 def test_format_all_title_no_accounts_is_bare_icon():
