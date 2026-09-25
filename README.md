@@ -250,6 +250,8 @@ Shows every account's 5h / 7d / spend usage and switches with a click (specific 
 
 *Settings → Menu bar shows → All accounts* swaps the single-account title for every account at once: each account's `5h · 7d` over its name, green below 50%, orange up to your auto-switch threshold, red at or past it, with the account in use highlighted. Disabled accounts are left out.
 
+<img src="assets/menubar-all-accounts.png" width="420" alt="Menu bar showing three accounts, each with 5h and 7d usage over its name; the account in use is highlighted">
+
 **Keep it running without a terminal.** `cswap menubar` runs in the foreground, so the status item dies with the terminal that started it and does not come back after a reboot. `--install-service` hands it to launchd instead — starts at login, restarts on crash, no `.app` bundle:
 
 ```bash
