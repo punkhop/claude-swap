@@ -38,6 +38,7 @@ REFRESH_CHOICES: tuple[int, ...] = (30, 60, 300)
 AUTO_THRESHOLD_CHOICES: tuple[int, ...] = (80, 90, 95, 98)
 TITLE_PCT_CHOICES: tuple[str, ...] = ("off", "5h", "7d", "both")
 TITLE_STYLE_CHOICES: tuple[str, ...] = ("active", "all")
+MENU_STYLE_CHOICES: tuple[str, ...] = ("text", "cards")
 # Below this a window is "comfortable" (green); from here up to the auto-switch
 # threshold it is "warn" (orange); at or past the threshold it is "high" (red).
 WARN_PCT = 50
@@ -102,6 +103,7 @@ class MenuBarSettings:
     title_pct: str = "both"  # one of TITLE_PCT_CHOICES
     title_scoped: bool = False  # append per-model weekly limits (e.g. Fable) to the title
     title_style: str = "active"  # one of TITLE_STYLE_CHOICES: active account only, or every account
+    menu_style: str = "text"  # one of MENU_STYLE_CHOICES: one text line per account, or usage cards
     refresh_interval: int = 60
     auto_switch_enabled: bool = False
 
@@ -485,6 +487,242 @@ def all_accounts_image(AppKit, cells: list[TitleCell], threshold: int):
         return True
 
     return AppKit.NSImage.imageWithSize_flipped_drawingHandler_((width, height), False, _draw)
+
+
+# ---- usage cards (Settings → Dropdown shows → Usage cards) --------------------
+
+@dataclass(frozen=True)
+class CardWindow:
+    """One usage bar on an account card."""
+
+    label: str  # "Session", "Weekly", or a model name
+    pct: float
+    level: str  # usage_level bucket; "unknown" when the account's numbers are stale
+    resets: str | None  # "Resets 3:10 PM", "Resets Oct 4, 4:00 AM"
+
+
+@dataclass(frozen=True)
+class AccountCard:
+    """One account's card in the dropdown."""
+
+    name: str
+    email: str | None  # shown beside the name only when an alias is the name
+    active: bool
+    disabled: bool
+    full: str | None  # "Full" (5h or 7d used up) or "<model> full"; None when there's room
+    note: str | None  # sentinel text (token expired, …) — the bars are last-known, not live
+    windows: tuple[CardWindow, ...]
+
+
+def _reset_text(window: dict | None, now: float) -> str | None:
+    """``Resets 3:10 PM`` today, ``Resets tomorrow 9:00 AM``, else ``Resets Oct 4, 4:00 AM``."""
+    ts = _resets_at_ts(window)
+    if ts == float("inf") or ts <= now:
+        return None
+    when = datetime.fromtimestamp(ts)
+    clock = when.strftime("%I:%M %p").lstrip("0")
+    days = (when.date() - datetime.fromtimestamp(now).date()).days
+    if days == 0:
+        return f"Resets {clock}"
+    if days == 1:
+        return f"Resets tomorrow {clock}"
+    return f"Resets {when:%b} {when.day}, {clock}"
+
+
+def account_cards(accounts: list, threshold: int, now: float | None = None) -> list[AccountCard]:
+    """Build the dropdown cards from ``_adapt_snapshot`` rows.
+
+    Every account gets a card (disabled ones too — the dropdown is where you
+    re-enable them). Windows come from the last-good measurement with the
+    weekly ones rolled past a passed reset, the same as the text rows.
+    """
+    if now is None:
+        now = time.time()
+    cards = []
+    for _num, email, is_active, display, last_good, alias, disabled, fetched_at in accounts:
+        stale = isinstance(display, str)
+        usage = last_good if isinstance(last_good, dict) else {}
+        windows: list[CardWindow] = []
+        full = None
+        named = [
+            ("Session", usage.get("five_hour"), False),
+            ("Weekly", _rolled_weekly_window(usage.get("seven_day"), now), True),
+        ]
+        for window in usage.get("scoped") or []:
+            window = _rolled_weekly_window(window, now)
+            if isinstance(window, dict) and window.get("name"):
+                named.append((str(window["name"]), window, True))
+        for label, window, weekly in named:
+            if not (isinstance(window, dict) and isinstance(window.get("pct"), (int, float))):
+                continue
+            pct = float(window["pct"])
+            resets = _reset_text(window, now)
+            if weekly and resets:
+                pace_result = pace.compute_pace(window, fetched_at=fetched_at)
+                if pace_result and pace_result.ahead and pct < 100:
+                    resets += " · ahead of pace"
+            if pct >= 100 and full != "Full":
+                # a used-up session/weekly window outranks a used-up model limit
+                full = "Full" if label in ("Session", "Weekly") else full or f"{label} full"
+            windows.append(
+                CardWindow(
+                    label=label,
+                    pct=pct,
+                    level="unknown" if stale else usage_level(pct, threshold),
+                    resets=resets,
+                )
+            )
+        note = display if stale else (None if windows else "usage unavailable")
+        cards.append(
+            AccountCard(
+                name=alias if alias else _local_part(email, limit=24),
+                email=email if alias else None,
+                active=bool(is_active),
+                disabled=bool(disabled),
+                full=full,
+                note=note,
+                windows=tuple(windows),
+            )
+        )
+    return cards
+
+
+CARD_WIDTH = 260.0
+_CARD_MARGIN_X, _CARD_MARGIN_Y, _CARD_PAD = 6.0, 3.0, 10.0
+_CARD_HEADER_H, _CARD_NOTE_H, _CARD_WINDOW_H = 24.0, 16.0, 44.0
+
+
+def card_height(card: AccountCard) -> float:
+    """Height of a card's menu row, from its header, note, and bars."""
+    body = _CARD_HEADER_H + (_CARD_NOTE_H if card.note else 0.0) + _CARD_WINDOW_H * len(card.windows)
+    return 2 * _CARD_MARGIN_Y + 2 * _CARD_PAD + body - (4.0 if card.windows else 0.0)
+
+
+_CARD_VIEW_CLASS = None
+
+
+def card_view_class(AppKit):
+    """The NSView subclass that draws an :class:`AccountCard` as a menu row.
+
+    Defined once per process (Objective-C class names are global). Drawing
+    happens in ``drawRect_`` so the system colours follow light/dark and the
+    menu's hover highlight; a click fires the menu item's own action, so the
+    row switches accounts exactly like a text row.
+    """
+    global _CARD_VIEW_CLASS
+    if _CARD_VIEW_CLASS is not None:
+        return _CARD_VIEW_CLASS
+
+    def _attr(text, size, weight, color):
+        return AppKit.NSAttributedString.alloc().initWithString_attributes_(
+            text,
+            {
+                AppKit.NSFontAttributeName: AppKit.NSFont.systemFontOfSize_weight_(size, weight),
+                AppKit.NSForegroundColorAttributeName: color,
+            },
+        )
+
+    def _pill(text, color, right, y):
+        """Draw a small tinted pill ending at ``right``; returns its left edge."""
+        label = _attr(text, 10, AppKit.NSFontWeightSemibold, color)
+        size = label.size()
+        w, h = size.width + 12.0, size.height + 2.0
+        x = right - w
+        color.colorWithAlphaComponent_(0.18).setFill()
+        AppKit.NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(((x, y), (w, h)), h / 2, h / 2).fill()
+        label.drawAtPoint_((x + 6.0, y + 1.0))
+        return x - 6.0
+
+    class CswapAccountCardView(AppKit.NSView):
+        def isFlipped(self):
+            return True
+
+        def drawRect_(self, _rect):
+            card = self.card
+            primary = AppKit.NSColor.labelColor()
+            secondary = AppKit.NSColor.secondaryLabelColor()
+            levels = {
+                "ok": AppKit.NSColor.systemGreenColor(),
+                "warn": AppKit.NSColor.systemOrangeColor(),
+                "high": AppKit.NSColor.systemRedColor(),
+                "unknown": secondary,
+            }
+            bounds = self.bounds()
+            item = self.enclosingMenuItem()
+            hovered = item is not None and item.isHighlighted()
+            box = ((_CARD_MARGIN_X, _CARD_MARGIN_Y),
+                   (bounds.size.width - 2 * _CARD_MARGIN_X, bounds.size.height - 2 * _CARD_MARGIN_Y))
+            primary.colorWithAlphaComponent_(0.12 if hovered else 0.06).setFill()
+            AppKit.NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(box, 8.0, 8.0).fill()
+            if card.active:
+                AppKit.NSColor.systemGreenColor().colorWithAlphaComponent_(0.6).setStroke()
+                border = AppKit.NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
+                    ((box[0][0] + 0.5, box[0][1] + 0.5), (box[1][0] - 1, box[1][1] - 1)), 8.0, 8.0
+                )
+                border.setLineWidth_(1.0)
+                border.stroke()
+
+            left = _CARD_MARGIN_X + _CARD_PAD
+            right = bounds.size.width - _CARD_MARGIN_X - _CARD_PAD
+            y = _CARD_MARGIN_Y + _CARD_PAD
+
+            # header: name (+ email) on the left, status pills on the right
+            pill_x = right
+            if card.full:
+                pill_x = _pill(card.full, levels["high"], pill_x, y)
+            if card.disabled:
+                pill_x = _pill("Disabled", secondary, pill_x, y)
+            if card.active:
+                pill_x = _pill("Active", levels["ok"], pill_x, y)
+            name = _attr(card.name, 13, AppKit.NSFontWeightSemibold,
+                         secondary if card.disabled else primary)
+            name.drawAtPoint_((left, y - 1.0))
+            if card.email:
+                email = _attr(card.email, 11, AppKit.NSFontWeightRegular, secondary)
+                ex = left + name.size().width + 6.0
+                if ex + email.size().width <= pill_x:
+                    email.drawAtPoint_((ex, y + 0.5))
+            y += _CARD_HEADER_H
+
+            if card.note:
+                note = _attr(card.note, 10, AppKit.NSFontWeightRegular, secondary)
+                note.drawInRect_(((left, y), (right - left, _CARD_NOTE_H)))
+                y += _CARD_NOTE_H
+
+            for w in card.windows:
+                color = levels[w.level]
+                label = _attr(w.label, 12, AppKit.NSFontWeightMedium, primary)
+                label.drawAtPoint_((left, y))
+                pct = _attr(f"{w.pct:.0f}%", 12, AppKit.NSFontWeightSemibold, color)
+                pct.drawAtPoint_((right - pct.size().width, y))
+                bar_y = y + 18.0
+                primary.colorWithAlphaComponent_(0.1).setFill()
+                AppKit.NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
+                    ((left, bar_y), (right - left, 5.0)), 2.5, 2.5
+                ).fill()
+                fill_w = (right - left) * max(0.0, min(w.pct, 100.0)) / 100.0
+                if fill_w > 0:
+                    color.setFill()
+                    AppKit.NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
+                        ((left, bar_y), (max(fill_w, 5.0), 5.0)), 2.5, 2.5
+                    ).fill()
+                if w.resets:
+                    _attr(w.resets, 10, AppKit.NSFontWeightRegular, secondary).drawAtPoint_(
+                        (left, bar_y + 7.0)
+                    )
+                y += _CARD_WINDOW_H
+
+        def mouseUp_(self, _event):
+            # Views in menu items get the click instead of the menu: close the
+            # menu, then fire the item's own target/action (the rumps callback).
+            item = self.enclosingMenuItem()
+            if item is None or item.action() is None:
+                return
+            item.menu().cancelTracking()
+            AppKit.NSApp.sendAction_to_from_(item.action(), item.target(), item)
+
+    _CARD_VIEW_CLASS = CswapAccountCardView
+    return _CARD_VIEW_CLASS
 
 
 def format_usage_log(email: str, usage: dict | str | None) -> str | None:
@@ -947,14 +1185,21 @@ def run(switcher) -> int:
                 _purge(self.menu._menu)
             self.menu.clear()
             account_items = []
-            for num, email, is_active, display, _last_good, alias, disabled, fetched_at in self.snapshot["accounts"]:
+            accounts = self.snapshot["accounts"]
+            cards = (
+                account_cards(accounts, threshold or int(AutoSwitchSettings().threshold))
+                if self.settings.menu_style == "cards" else None
+            )
+            for i, (num, email, is_active, display, _last_good, alias, disabled, fetched_at) in enumerate(accounts):
                 item = rumps.MenuItem(
                     format_account_label(
                         num, email, display, alias=alias, disabled=disabled, fetched_at=fetched_at
                     ),
                     callback=self._make_switch_to(num),
                 )
-                item.state = 1 if is_active else 0
+                item.state = 1 if is_active and cards is None else 0  # a card says Active itself
+                if cards is not None:
+                    self._set_card_view(item, cards[i])
                 account_items.append(item)
             if not account_items:
                 account_items.append(rumps.MenuItem("No managed accounts", callback=None))
@@ -976,6 +1221,19 @@ def run(switcher) -> int:
                 rumps.MenuItem("Refresh now", callback=self.on_refresh_now),
                 rumps.MenuItem("Quit", callback=self.on_quit),
             ]
+
+        def _set_card_view(self, item, card):
+            """Draw this account row as a usage card; on failure it stays a text row."""
+            try:
+                view = card_view_class(AppKit).alloc().initWithFrame_(
+                    ((0, 0), (CARD_WIDTH, card_height(card)))
+                )
+                view.card = card
+                # stretch to the menu's width instead of leaving a gap to its right
+                view.setAutoresizingMask_(AppKit.NSViewWidthSizable)
+                item._menuitem.setView_(view)
+            except Exception:
+                self.switcher._logger.debug("menubar card view failed", exc_info=True)
 
         def _add_menu(self, rumps):
             menu = rumps.MenuItem("Add account")
@@ -1035,6 +1293,14 @@ def run(switcher) -> int:
                 ch.state = 1 if self.settings.title_style == style else 0
                 style_menu.add(ch)
             menu.add(style_menu)
+
+            dropdown_menu = rumps.MenuItem("Dropdown shows")
+            dropdown_labels = {"text": "One line per account", "cards": "Usage cards"}
+            for style in MENU_STYLE_CHOICES:
+                ch = rumps.MenuItem(dropdown_labels[style], callback=self._make_menu_style(style))
+                ch.state = 1 if self.settings.menu_style == style else 0
+                dropdown_menu.add(ch)
+            menu.add(dropdown_menu)
 
             # The options below shape the single-account title only; the
             # all-accounts view ignores them, so grey them out there.
@@ -1219,6 +1485,12 @@ def run(switcher) -> int:
         def _make_title_style(self, style):
             def cb(_sender):
                 self.settings.title_style = style
+                self._save_and_rebuild()
+            return cb
+
+        def _make_menu_style(self, style):
+            def cb(_sender):
+                self.settings.menu_style = style
                 self._save_and_rebuild()
             return cb
 
